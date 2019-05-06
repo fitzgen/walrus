@@ -11,6 +11,7 @@ pub struct ModuleConfig {
     pub(crate) skip_strict_validate: bool,
     pub(crate) skip_producers_section: bool,
     pub(crate) skip_name_section: bool,
+    pub(crate) preserve_code_transform: bool,
 }
 
 impl ModuleConfig {
@@ -94,6 +95,14 @@ impl ModuleConfig {
     /// By default this flag is `false`
     pub fn only_stable_features(&mut self, only: bool) -> &mut ModuleConfig {
         self.only_stable_features = only;
+        self
+    }
+
+    /// Sets a flag to whether code transform is preverved during parsing.
+    ///
+    /// By default this flag is `false`.
+    pub fn preserve_code_transform(&mut self, preserve: bool) -> &mut ModuleConfig {
+        self.preserve_code_transform = preserve;
         self
     }
 

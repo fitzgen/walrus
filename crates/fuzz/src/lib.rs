@@ -76,6 +76,7 @@ impl Config {
             .unwrap()
             .emit_wasm()
             .unwrap()
+            .into()
     }
 
     fn run_one(&self, wat: &str) -> Option<FailingTestCase> {

@@ -11,6 +11,7 @@ pub(crate) fn run(
     indices: &IdsToIndices,
     local_indices: &IdHashMap<Local, u32>,
     encoder: &mut Encoder,
+    map: Option<&mut IdHashMap<Expr, usize>>,
 ) {
     let mut v = Emit {
         func,
@@ -19,6 +20,7 @@ pub(crate) fn run(
         blocks: vec![],
         encoder,
         local_indices,
+        map,
     };
     v.visit(func.entry_block());
 }
@@ -40,6 +42,9 @@ struct Emit<'a, 'b> {
 
     // The instruction sequence we are building up to emit.
     encoder: &'a mut Encoder<'b>,
+
+    // Encoded ExprId -> offset map.
+    map: Option<&'a mut IdHashMap<Expr, usize>>,
 }
 
 impl Emit<'_, '_> {
@@ -55,6 +60,10 @@ impl Emit<'_, '_> {
 
         let old = self.id;
         self.id = id;
+
+        if let Some(map) = self.map.as_mut() {
+            map.insert(old, self.encoder.pos());
+        }
 
         match self.func.get(id) {
             Const(e) => e.value.emit(self.encoder),

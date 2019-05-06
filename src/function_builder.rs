@@ -1,4 +1,5 @@
 use crate::ir::*;
+use crate::map::IdHashMap;
 use crate::tombstone_arena::TombstoneArena;
 use crate::{FunctionId, LocalFunction, Module, TypeId, ValType};
 use crate::{ModuleFunctions, ModuleTypes};
@@ -141,7 +142,7 @@ impl FunctionBuilder {
             results: ty.results().to_vec().into_boxed_slice(),
             exprs,
         });
-        let func = LocalFunction::new(ty_id, args, self, entry);
+        let func = LocalFunction::new(ty_id, args, self, entry, IdHashMap::default());
         funcs.add_local(func)
     }
 }

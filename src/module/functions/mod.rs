@@ -6,6 +6,8 @@ use crate::dot::Dot;
 use crate::emit::{Emit, EmitContext, Section};
 use crate::encode::Encoder;
 use crate::error::Result;
+use crate::ir::Expr;
+use crate::map::IdHashMap;
 use crate::module::imports::ImportId;
 use crate::module::Module;
 use crate::parse::IndicesToIds;
@@ -369,12 +371,25 @@ impl Module {
             bodies.push((id, body, args, ty));
         }
 
+        let preserve_code_transform = self.config.preserve_code_transform;
+
         // Wasm modules can often have a lot of functions and this operation can
         // take some time, so parse all function bodies in parallel.
         let results = bodies
             .into_par_iter()
             .map(|(id, body, args, ty)| {
-                (id, LocalFunction::parse(self, indices, id, ty, args, body))
+                (
+                    id,
+                    LocalFunction::parse(
+                        self,
+                        indices,
+                        id,
+                        ty,
+                        args,
+                        preserve_code_transform,
+                        body,
+                    ),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -413,6 +428,30 @@ fn used_local_functions<'a>(cx: &mut EmitContext<'a>) -> Vec<(FunctionId, &'a Lo
     functions
 }
 
+fn remap_offsets(
+    src: &IdHashMap<Expr, usize>,
+    dst: &IdHashMap<Expr, usize>,
+) -> Vec<(usize, usize)> {
+    let mut result = Vec::new();
+    for (expr_id, src_offset) in src {
+        if let Some(dst_offset) = dst.get(expr_id) {
+            result.push((*src_offset, *dst_offset));
+        }
+    }
+    result
+}
+
+fn append_code_offsets(
+    code_transform: &mut Vec<(usize, usize)>,
+    code_offset: usize,
+    map: Vec<(usize, usize)>,
+) {
+    for (src, dst) in map {
+        let dst = dst + code_offset;
+        code_transform.push((src, dst));
+    }
+}
+
 impl Emit for ModuleFunctions {
     fn emit(&self, cx: &mut EmitContext) {
         log::debug!("emit code section");
@@ -424,6 +463,8 @@ impl Emit for ModuleFunctions {
         let mut cx = cx.start_section(Section::Code);
         cx.encoder.usize(functions.len());
 
+        let generate_map = cx.module.config.preserve_code_transform;
+
         // Functions can typically take awhile to serialize, so serialize
         // everything in parallel. Afterwards we'll actually place all the
         // functions together.
@@ -433,15 +474,26 @@ impl Emit for ModuleFunctions {
                 log::debug!("emit function {:?} {:?}", id, cx.module.funcs.get(id).name);
                 let mut wasm = Vec::new();
                 let mut encoder = Encoder::new(&mut wasm);
+                let mut map = if generate_map {
+                    Some(IdHashMap::default())
+                } else {
+                    None
+                };
+
                 let (used_locals, local_indices) = func.emit_locals(cx.module, &mut encoder);
-                func.emit_instructions(cx.indices, &local_indices, &mut encoder);
-                (wasm, id, used_locals, local_indices)
+                func.emit_instructions(cx.indices, &local_indices, &mut encoder, map.as_mut());
+                let map = map.map(|m| remap_offsets(&func.offsets, &m));
+                (wasm, id, used_locals, local_indices, map)
             })
             .collect::<Vec<_>>();
 
         cx.indices.locals.reserve(bytes.len());
-        for (wasm, id, used_locals, local_indices) in bytes {
+        for (wasm, id, used_locals, local_indices, map) in bytes {
+            let code_offset = cx.encoder.pos();
             cx.encoder.bytes(&wasm);
+            if let Some(map) = map {
+                append_code_offsets(&mut cx.code_transform, code_offset, map);
+            }
             cx.indices.locals.insert(id, local_indices);
             cx.locals.insert(id, used_locals);
         }

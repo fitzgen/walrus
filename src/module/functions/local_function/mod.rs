@@ -35,9 +35,10 @@ pub struct LocalFunction {
     /// The entry block for this function. Always `Some` after the constructor
     /// returns.
     entry: Option<BlockId>,
-    //
-    // TODO: provenance: ExprId -> offset in code section of the original
-    // instruction. This will be necessary for preserving debug info.
+
+    /// Stores the ExprId -> offset map in code section of the original
+    /// instruction. This will be necessary for preserving debug info.
+    pub offsets: IdHashMap<Expr, usize>,
 }
 
 impl LocalFunction {
@@ -47,12 +48,14 @@ impl LocalFunction {
         args: Vec<LocalId>,
         exprs: FunctionBuilder,
         entry: BlockId,
+        offsets: IdHashMap<Expr, usize>,
     ) -> LocalFunction {
         LocalFunction {
             ty,
             args,
             entry: Some(entry),
             exprs,
+            offsets,
         }
     }
 
@@ -66,13 +69,15 @@ impl LocalFunction {
         id: FunctionId,
         ty: TypeId,
         args: Vec<LocalId>,
-        body: wasmparser::OperatorsReader,
+        preserve_code_transform: bool,
+        mut body: wasmparser::OperatorsReader,
     ) -> Result<LocalFunction> {
         let mut func = LocalFunction {
             ty,
             exprs: FunctionBuilder::new(),
             args,
             entry: None,
+            offsets: IdHashMap::default(),
         };
 
         let result: Vec<_> = module.types.get(ty).results().iter().cloned().collect();
@@ -86,9 +91,17 @@ impl LocalFunction {
 
         let entry = ctx.push_control(BlockKind::FunctionEntry, result.clone(), result);
         ctx.func.entry = Some(entry);
-        for inst in body {
-            let inst = inst?;
-            validate_instruction(&mut ctx, inst)?;
+        while !body.eof() {
+            let (inst, pos) = body.read_with_offset()?;
+            let expr_id = validate_instruction(&mut ctx, inst)?;
+            if preserve_code_transform {
+                match expr_id {
+                    Some(id) => {
+                        ctx.func.offsets.insert(id, pos);
+                    }
+                    None => (),
+                }
+            }
         }
         if !ctx.controls.is_empty() {
             bail!("function failed to end with `end`");
@@ -266,8 +279,9 @@ impl LocalFunction {
         indices: &IdsToIndices,
         local_indices: &IdHashMap<Local, u32>,
         dst: &mut Encoder,
+        map: Option<&mut IdHashMap<Expr, usize>>,
     ) {
-        emit::run(self, indices, local_indices, dst)
+        emit::run(self, indices, local_indices, dst, map)
     }
 }
 
@@ -349,27 +363,28 @@ impl DotExpr<'_, '_> {
     }
 }
 
-fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<()> {
+fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<Option<ExprId>> {
     use crate::ir::ExtendedLoad::*;
     use crate::ValType::*;
 
-    let const_ = |ctx: &mut ValidationContext, ty, value| {
+    let const_ = |ctx: &mut ValidationContext, ty, value| -> Option<ExprId> {
         let expr = ctx.func.alloc(Const { value });
         ctx.push_operand(Some(ty), expr);
+        Some(expr.into())
     };
 
-    let one_op = |ctx: &mut ValidationContext, input, output, op| -> Result<()> {
+    let one_op = |ctx: &mut ValidationContext, input, output, op| -> Result<Option<ExprId>> {
         let (_, expr) = ctx.pop_operand_expected(Some(input))?;
         let expr = ctx.func.alloc(Unop { op, expr });
         ctx.push_operand(Some(output), expr);
-        Ok(())
+        Ok(Some(expr.into()))
     };
-    let two_ops = |ctx: &mut ValidationContext, lhs, rhs, output, op| -> Result<()> {
+    let two_ops = |ctx: &mut ValidationContext, lhs, rhs, output, op| -> Result<Option<ExprId>> {
         let (_, rhs) = ctx.pop_operand_expected(Some(rhs))?;
         let (_, lhs) = ctx.pop_operand_expected(Some(lhs))?;
         let expr = ctx.func.alloc(Binop { op, lhs, rhs });
         ctx.push_operand(Some(output), expr);
-        Ok(())
+        Ok(Some(expr.into()))
     };
 
     let binop = |ctx, ty, op| two_ops(ctx, ty, ty, ty, op);
@@ -387,7 +402,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
         })
     };
 
-    let load = |ctx: &mut ValidationContext, arg, ty, kind| -> Result<()> {
+    let load = |ctx: &mut ValidationContext, arg, ty, kind| -> Result<Option<ExprId>> {
         let (_, address) = ctx.pop_operand_expected(Some(I32))?;
         let memory = ctx.indices.get_memory(0)?;
         let arg = mem_arg(&arg)?;
@@ -398,10 +413,10 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             memory,
         });
         ctx.push_operand(Some(ty), expr);
-        Ok(())
+        Ok(Some(expr.into()))
     };
 
-    let store = |ctx: &mut ValidationContext, arg, ty, kind| -> Result<()> {
+    let store = |ctx: &mut ValidationContext, arg, ty, kind| -> Result<Option<ExprId>> {
         let (_, value) = ctx.pop_operand_expected(Some(ty))?;
         let (_, address) = ctx.pop_operand_expected(Some(I32))?;
         let memory = ctx.indices.get_memory(0)?;
@@ -414,10 +429,10 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             value,
         });
         ctx.add_to_current_frame_block(expr);
-        Ok(())
+        Ok(Some(expr.into()))
     };
 
-    let atomicrmw = |ctx: &mut ValidationContext, arg, ty, op, width| -> Result<()> {
+    let atomicrmw = |ctx: &mut ValidationContext, arg, ty, op, width| -> Result<Option<ExprId>> {
         let (_, value) = ctx.pop_operand_expected(Some(ty))?;
         let (_, address) = ctx.pop_operand_expected(Some(I32))?;
         let memory = ctx.indices.get_memory(0)?;
@@ -431,10 +446,10 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             width,
         });
         ctx.push_operand(Some(ty), expr);
-        Ok(())
+        Ok(Some(expr.into()))
     };
 
-    let cmpxchg = |ctx: &mut ValidationContext, arg, ty, width| -> Result<()> {
+    let cmpxchg = |ctx: &mut ValidationContext, arg, ty, width| -> Result<Option<ExprId>> {
         let (_, replacement) = ctx.pop_operand_expected(Some(ty))?;
         let (_, expected) = ctx.pop_operand_expected(Some(ty))?;
         let (_, address) = ctx.pop_operand_expected(Some(I32))?;
@@ -449,10 +464,10 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             replacement,
         });
         ctx.push_operand(Some(ty), expr);
-        Ok(())
+        Ok(Some(expr.into()))
     };
 
-    match inst {
+    let details: Option<ExprId> = match inst {
         Operator::Call { function_index } => {
             let func = ctx
                 .indices
@@ -464,6 +479,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             args.reverse();
             let expr = ctx.func.alloc(Call { func, args });
             ctx.push_operands(fun_ty.results(), expr.into());
+            Some(expr.into())
         }
         Operator::CallIndirect { index, table_index } => {
             let type_id = ctx
@@ -485,12 +501,14 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 args,
             });
             ctx.push_operands(ty.results(), expr.into());
+            Some(expr.into())
         }
         Operator::GetLocal { local_index } => {
             let local = ctx.indices.get_local(ctx.func_id, local_index)?;
             let ty = ctx.module.locals.get(local).ty();
             let expr = ctx.func.alloc(LocalGet { local });
             ctx.push_operand(Some(ty), expr);
+            Some(expr.into())
         }
         Operator::SetLocal { local_index } => {
             let local = ctx.indices.get_local(ctx.func_id, local_index)?;
@@ -498,6 +516,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let (_, value) = ctx.pop_operand_expected(Some(ty))?;
             let expr = ctx.func.alloc(LocalSet { local, value });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::TeeLocal { local_index } => {
             let local = ctx.indices.get_local(ctx.func_id, local_index)?;
@@ -505,6 +524,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let (_, value) = ctx.pop_operand_expected(Some(ty))?;
             let expr = ctx.func.alloc(LocalTee { local, value });
             ctx.push_operand(Some(ty), expr);
+            Some(expr.into())
         }
         Operator::GetGlobal { global_index } => {
             let global = ctx
@@ -514,6 +534,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let ty = ctx.module.globals.get(global).ty;
             let expr = ctx.func.alloc(GlobalGet { global });
             ctx.push_operand(Some(ty), expr);
+            Some(expr.into())
         }
         Operator::SetGlobal { global_index } => {
             let global = ctx
@@ -524,15 +545,12 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let (_, value) = ctx.pop_operand_expected(Some(ty))?;
             let expr = ctx.func.alloc(GlobalSet { global, value });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::I32Const { value } => const_(ctx, I32, Value::I32(value)),
         Operator::I64Const { value } => const_(ctx, I64, Value::I64(value)),
-        Operator::F32Const { value } => {
-            const_(ctx, F32, Value::F32(f32::from_bits(value.bits())));
-        }
-        Operator::F64Const { value } => {
-            const_(ctx, F64, Value::F64(f64::from_bits(value.bits())));
-        }
+        Operator::F32Const { value } => const_(ctx, F32, Value::F32(f32::from_bits(value.bits()))),
+        Operator::F64Const { value } => const_(ctx, F64, Value::F64(f64::from_bits(value.bits()))),
         Operator::V128Const { value } => {
             let n = value.bytes();
             let val = ((n[0] as u128) << 0)
@@ -551,7 +569,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 | ((n[13] as u128) << 104)
                 | ((n[14] as u128) << 112)
                 | ((n[15] as u128) << 120);
-            const_(ctx, V128, Value::V128(val));
+            const_(ctx, V128, Value::V128(val))
         }
         Operator::I32Eqz => testop(ctx, I32, UnaryOp::I32Eqz)?,
         Operator::I32Eq => relop(ctx, I32, BinaryOp::I32Eq)?,
@@ -699,6 +717,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let (_, expr) = ctx.pop_operand()?;
             let expr = ctx.func.alloc(Drop { expr });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::Select => {
             let (_, condition) = ctx.pop_operand_expected(Some(I32))?;
@@ -710,6 +729,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 alternative,
             });
             ctx.push_operand(t2, expr);
+            Some(expr.into())
         }
         Operator::Return => {
             let fn_ty = ctx.module.funcs.get(ctx.func_id).ty();
@@ -717,18 +737,22 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let values = ctx.pop_operands(expected)?.into_boxed_slice();
             let expr = ctx.func.alloc(Return { values });
             ctx.unreachable(expr);
+            Some(expr.into())
         }
         Operator::Unreachable => {
             let expr = ctx.func.alloc(Unreachable {});
             ctx.unreachable(expr);
+            Some(expr.into())
         }
         Operator::Block { ty } => {
             let results = ValType::from_block_ty(ty)?;
-            ctx.push_control(BlockKind::Block, results.clone(), results);
+            let id = ctx.push_control(BlockKind::Block, results.clone(), results);
+            Some(id.into())
         }
         Operator::Loop { ty } => {
             let t = ValType::from_block_ty(ty)?;
-            ctx.push_control(BlockKind::Loop, vec![].into_boxed_slice(), t);
+            let id = ctx.push_control(BlockKind::Loop, vec![].into_boxed_slice(), t);
+            Some(id.into())
         }
         Operator::If { ty } => {
             let ty = ValType::from_block_ty(ty)?;
@@ -740,6 +764,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 consequent,
                 alternative: None,
             });
+            Some(consequent.into())
         }
         Operator::End => {
             let (results, block) = ctx.pop_control()?;
@@ -782,6 +807,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 _ => block.into(),
             };
             ctx.push_operands(&results, id);
+            Some(block.into())
         }
         Operator::Else => {
             let (results, consequent) = ctx.pop_control()?;
@@ -799,6 +825,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 bail!("`else` without a leading `if`")
             }
             last.alternative = Some(alternative);
+            Some(alternative.into())
         }
         Operator::Br { relative_depth } => {
             let n = relative_depth as usize;
@@ -811,6 +838,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 args,
             });
             ctx.unreachable(expr);
+            Some(expr.into())
         }
         Operator::BrIf { relative_depth } => {
             let n = relative_depth as usize;
@@ -826,6 +854,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 args,
             });
             ctx.push_operands(&expected, expr.into());
+            Some(expr.into())
         }
         Operator::BrTable { table } => {
             let len = table.len();
@@ -869,6 +898,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             });
 
             ctx.unreachable(expr);
+            Some(expr.into())
         }
 
         Operator::MemorySize { reserved } => {
@@ -878,6 +908,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let memory = ctx.indices.get_memory(0)?;
             let expr = ctx.func.alloc(MemorySize { memory });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
         Operator::MemoryGrow { reserved } => {
             if reserved != 0 {
@@ -887,6 +918,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let memory = ctx.indices.get_memory(0)?;
             let expr = ctx.func.alloc(MemoryGrow { memory, pages });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
         Operator::MemoryInit { segment } => {
             let (_, len) = ctx.pop_operand_expected(Some(I32))?;
@@ -902,11 +934,13 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 data,
             });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::DataDrop { segment } => {
             let data = ctx.indices.get_data(segment)?;
             let expr = ctx.func.alloc(DataDrop { data });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::MemoryCopy => {
             let (_, len) = ctx.pop_operand_expected(Some(I32))?;
@@ -921,6 +955,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 dst: memory,
             });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::MemoryFill => {
             let (_, len) = ctx.pop_operand_expected(Some(I32))?;
@@ -934,9 +969,10 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 memory,
             });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
 
-        Operator::Nop => {}
+        Operator::Nop => None,
 
         Operator::I32Load { memarg } => load(ctx, memarg, I32, LoadKind::I32 { atomic: false })?,
         Operator::I64Load { memarg } => load(ctx, memarg, I64, LoadKind::I64 { atomic: false })?,
@@ -1065,157 +1101,153 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
         }
 
         Operator::I32AtomicRmwAdd { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Add, AtomicWidth::I32)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Add, AtomicWidth::I32)?
         }
         Operator::I64AtomicRmwAdd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64)?
         }
         Operator::I32AtomicRmw8UAdd { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Add, AtomicWidth::I32_8)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Add, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16UAdd { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Add, AtomicWidth::I32_16)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Add, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8UAdd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64_8)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16UAdd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64_16)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32UAdd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64_32)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Add, AtomicWidth::I64_32)?
         }
 
         Operator::I32AtomicRmwSub { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Sub, AtomicWidth::I32)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Sub, AtomicWidth::I32)?
         }
         Operator::I64AtomicRmwSub { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64)?
         }
         Operator::I32AtomicRmw8USub { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Sub, AtomicWidth::I32_8)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Sub, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16USub { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Sub, AtomicWidth::I32_16)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Sub, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8USub { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64_8)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16USub { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64_16)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32USub { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64_32)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Sub, AtomicWidth::I64_32)?
         }
 
         Operator::I32AtomicRmwAnd { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::And, AtomicWidth::I32)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::And, AtomicWidth::I32)?
         }
         Operator::I64AtomicRmwAnd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64)?
         }
         Operator::I32AtomicRmw8UAnd { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::And, AtomicWidth::I32_8)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::And, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16UAnd { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::And, AtomicWidth::I32_16)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::And, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8UAnd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64_8)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16UAnd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64_16)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32UAnd { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64_32)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::And, AtomicWidth::I64_32)?
         }
 
         Operator::I32AtomicRmwOr { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Or, AtomicWidth::I32)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Or, AtomicWidth::I32)?
         }
         Operator::I64AtomicRmwOr { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64)?
         }
         Operator::I32AtomicRmw8UOr { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Or, AtomicWidth::I32_8)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Or, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16UOr { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Or, AtomicWidth::I32_16)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Or, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8UOr { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64_8)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16UOr { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64_16)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32UOr { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64_32)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Or, AtomicWidth::I64_32)?
         }
 
         Operator::I32AtomicRmwXor { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Xor, AtomicWidth::I32)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Xor, AtomicWidth::I32)?
         }
         Operator::I64AtomicRmwXor { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64)?
         }
         Operator::I32AtomicRmw8UXor { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Xor, AtomicWidth::I32_8)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Xor, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16UXor { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Xor, AtomicWidth::I32_16)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Xor, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8UXor { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64_8)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16UXor { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64_16)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32UXor { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64_32)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xor, AtomicWidth::I64_32)?
         }
 
         Operator::I32AtomicRmwXchg { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Xchg, AtomicWidth::I32)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Xchg, AtomicWidth::I32)?
         }
         Operator::I64AtomicRmwXchg { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64)?
         }
         Operator::I32AtomicRmw8UXchg { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Xchg, AtomicWidth::I32_8)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Xchg, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16UXchg { memarg } => {
-            atomicrmw(ctx, memarg, I32, AtomicOp::Xchg, AtomicWidth::I32_16)?;
+            atomicrmw(ctx, memarg, I32, AtomicOp::Xchg, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8UXchg { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64_8)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16UXchg { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64_16)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32UXchg { memarg } => {
-            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64_32)?;
+            atomicrmw(ctx, memarg, I64, AtomicOp::Xchg, AtomicWidth::I64_32)?
         }
 
-        Operator::I32AtomicRmwCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I32, AtomicWidth::I32)?;
-        }
-        Operator::I64AtomicRmwCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I64, AtomicWidth::I64)?;
-        }
+        Operator::I32AtomicRmwCmpxchg { memarg } => cmpxchg(ctx, memarg, I32, AtomicWidth::I32)?,
+        Operator::I64AtomicRmwCmpxchg { memarg } => cmpxchg(ctx, memarg, I64, AtomicWidth::I64)?,
         Operator::I32AtomicRmw8UCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I32, AtomicWidth::I32_8)?;
+            cmpxchg(ctx, memarg, I32, AtomicWidth::I32_8)?
         }
         Operator::I32AtomicRmw16UCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I32, AtomicWidth::I32_16)?;
+            cmpxchg(ctx, memarg, I32, AtomicWidth::I32_16)?
         }
         Operator::I64AtomicRmw8UCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I64, AtomicWidth::I64_8)?;
+            cmpxchg(ctx, memarg, I64, AtomicWidth::I64_8)?
         }
         Operator::I64AtomicRmw16UCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I64, AtomicWidth::I64_16)?;
+            cmpxchg(ctx, memarg, I64, AtomicWidth::I64_16)?
         }
         Operator::I64AtomicRmw32UCmpxchg { memarg } => {
-            cmpxchg(ctx, memarg, I64, AtomicWidth::I64_32)?;
+            cmpxchg(ctx, memarg, I64, AtomicWidth::I64_32)?
         }
         Operator::Wake { ref memarg } => {
             let (_, count) = ctx.pop_operand_expected(Some(I32))?;
@@ -1228,6 +1260,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 arg: mem_arg(memarg)?,
             });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
         Operator::I32Wait { ref memarg } | Operator::I64Wait { ref memarg } => {
             let (ty, sixty_four) = match inst {
@@ -1247,6 +1280,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 arg: mem_arg(memarg)?,
             });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
 
         Operator::TableGet { table } => {
@@ -1254,6 +1288,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let (_, index) = ctx.pop_operand_expected(Some(I32))?;
             let expr = ctx.func.alloc(TableGet { table, index });
             ctx.push_operand(Some(Anyref), expr);
+            Some(expr.into())
         }
         Operator::TableSet { table } => {
             let table = ctx.indices.get_table(table)?;
@@ -1269,6 +1304,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 value,
             });
             ctx.add_to_current_frame_block(expr);
+            Some(expr.into())
         }
         Operator::TableGrow { table } => {
             let table = ctx.indices.get_table(table)?;
@@ -1284,27 +1320,36 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
                 value,
             });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
         Operator::TableSize { table } => {
             let table = ctx.indices.get_table(table)?;
             let expr = ctx.func.alloc(TableSize { table });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
         Operator::RefNull => {
             let expr = ctx.func.alloc(RefNull {});
             ctx.push_operand(Some(Anyref), expr);
+            Some(expr.into())
         }
         Operator::RefIsNull => {
             let (_, value) = ctx.pop_operand_expected(Some(Anyref))?;
             let expr = ctx.func.alloc(RefIsNull { value });
             ctx.push_operand(Some(I32), expr);
+            Some(expr.into())
         }
 
         Operator::V8x16Shuffle { lines } => {
             let (_, hi) = ctx.pop_operand_expected(Some(V128))?;
             let (_, lo) = ctx.pop_operand_expected(Some(V128))?;
-            let expr = ctx.func.alloc(V128Shuffle { indices: lines, lo, hi });
+            let expr = ctx.func.alloc(V128Shuffle {
+                indices: lines,
+                lo,
+                hi,
+            });
             ctx.push_operand(Some(V128), expr);
+            Some(expr.into())
         }
 
         Operator::I8x16Splat => one_op(ctx, I32, V128, UnaryOp::I8x16Splat)?,
@@ -1410,6 +1455,7 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
             let (_, v1) = ctx.pop_operand_expected(Some(V128))?;
             let expr = ctx.func.alloc(V128Bitselect { mask, v1, v2 });
             ctx.push_operand(Some(V128), expr);
+            Some(expr.into())
         }
 
         Operator::I8x16Neg => unop(ctx, V128, UnaryOp::I8x16Neg)?,
@@ -1502,6 +1548,6 @@ fn validate_instruction(ctx: &mut ValidationContext, inst: Operator) -> Result<(
         | op @ Operator::TableCopy => {
             bail!("Have not implemented support for opcode yet: {:?}", op)
         }
-    }
-    Ok(())
+    };
+    Ok(details)
 }

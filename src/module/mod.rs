@@ -69,6 +69,23 @@ pub struct Module {
     pub(crate) config: ModuleConfig,
 }
 
+/// Emitted module information.
+#[derive(Debug)]
+pub struct EmitResult {
+    /// The wasm file bytecode.
+    pub wasm: Vec<u8>,
+
+    /// Optional code transform (if module generated from
+    /// the existing wasm file).
+    pub code_transform: Vec<(usize, usize)>,
+}
+
+impl Into<Vec<u8>> for EmitResult {
+    fn into(self) -> Vec<u8> {
+        self.wasm
+    }
+}
+
 impl Module {
     /// Create a default, empty module that uses the given configuration.
     pub fn with_config(config: ModuleConfig) -> Self {
@@ -230,13 +247,13 @@ impl Module {
     where
         P: AsRef<Path>,
     {
-        let buffer = self.emit_wasm()?;
+        let EmitResult { wasm: buffer, .. } = self.emit_wasm()?;
         fs::write(path, buffer).context("failed to write wasm module")?;
         Ok(())
     }
 
     /// Emit this module into an in-memory wasm buffer.
-    pub fn emit_wasm(&self) -> Result<Vec<u8>> {
+    pub fn emit_wasm(&self) -> Result<EmitResult> {
         log::debug!("start emit");
 
         let indices = &mut IdsToIndices::default();
@@ -249,6 +266,7 @@ impl Module {
             indices,
             encoder: Encoder::new(&mut wasm),
             locals: Default::default(),
+            code_transform: Vec::new(),
         };
         self.types.emit(&mut cx);
         self.imports.emit(&mut cx);
@@ -285,8 +303,13 @@ impl Module {
                 .raw(&section.data());
         }
 
+        let code_transform = cx.code_transform;
+
         log::debug!("emission finished");
-        Ok(wasm)
+        Ok(EmitResult {
+            wasm,
+            code_transform,
+        })
     }
 
     /// Returns an iterator over all functions in this module
