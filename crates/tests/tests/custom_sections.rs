@@ -48,7 +48,7 @@ fn round_trip_unkown_custom_sections() {
         [(world_id.into(), world.data())]
     );
 
-    let wasm = module.emit_wasm().unwrap();
+    let wasm = module.emit_wasm().unwrap().wasm;
     let mut module = config.parse(&wasm).unwrap();
 
     let world_round_tripped = module.customs.remove_raw("hello").unwrap();
@@ -58,6 +58,6 @@ fn round_trip_unkown_custom_sections() {
     assert_eq!(new_world.data(), world.data());
     module.customs.add(new_world);
 
-    let new_wasm = module.emit_wasm().unwrap();
+    let new_wasm = module.emit_wasm().unwrap().wasm;
     assert_eq!(wasm, new_wasm);
 }
