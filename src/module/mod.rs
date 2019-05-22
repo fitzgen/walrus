@@ -253,7 +253,7 @@ impl Module {
     }
 
     /// Emit this module into an in-memory wasm buffer.
-    pub fn emit_wasm(&self) -> Result<EmitResult> {
+    pub fn emit_wasm(&self) -> Result<Vec<u8>> {
         log::debug!("start emit");
 
         let indices = &mut IdsToIndices::default();
@@ -297,6 +297,8 @@ impl Module {
                 continue;
             }
 
+            section.
+
             log::debug!("emitting custom section {}", section.name());
             cx.custom_section(&section.name())
                 .encoder
@@ -306,10 +308,7 @@ impl Module {
         let code_transform = cx.code_transform;
 
         log::debug!("emission finished");
-        Ok(EmitResult {
-            wasm,
-            code_transform,
-        })
+        Ok(wasm)
     }
 
     /// Returns an iterator over all functions in this module
