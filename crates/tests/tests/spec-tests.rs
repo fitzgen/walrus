@@ -84,19 +84,15 @@ fn run(wast: &Path) -> Result<(), failure::Error> {
             }
             cmd => {
                 let wasm = fs::read(&path)?;
-                let wasm = config
+                let mut wasm = config
                     .parse(&wasm)
                     .context(format!("error parsing wasm (line {})", line))?;
-                let wasm1 = wasm
-                    .emit_wasm()
-                    .context(format!("error emitting wasm (line {})", line))?
-                    .wasm;
+                let wasm1 = wasm.emit_wasm();
                 fs::write(&path, &wasm1)?;
                 let wasm2 = config
                     .parse(&wasm1)
-                    .and_then(|m| m.emit_wasm())
-                    .context(format!("error re-parsing wasm (line {})", line))?
-                    .wasm;
+                    .map(|mut m| m.emit_wasm())
+                    .context(format!("error re-parsing wasm (line {})", line))?;
                 if wasm1 != wasm2 {
                     panic!("wasm module at line {} isn't deterministic", line);
                 }
@@ -124,7 +120,7 @@ fn run(wast: &Path) -> Result<(), failure::Error> {
             walrus::passes::gc::run(&mut module);
         }
 
-        let wasm = module.emit_wasm()?.wasm;
+        let wasm = module.emit_wasm();
         fs::write(&file, wasm)?;
     }
 

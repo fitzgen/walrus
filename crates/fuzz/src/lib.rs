@@ -75,7 +75,6 @@ impl Config {
         walrus::Module::from_buffer(&wasm)
             .unwrap()
             .emit_wasm()
-            .unwrap()
             .into()
     }
 

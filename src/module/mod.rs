@@ -36,6 +36,7 @@ pub use crate::module::types::ModuleTypes;
 use crate::parse::IndicesToIds;
 use failure::{bail, ResultExt};
 use std::fs;
+use std::mem;
 use std::path::Path;
 
 pub use self::config::ModuleConfig;
@@ -66,25 +67,17 @@ pub struct Module {
     /// The name of this module, used for debugging purposes in the `name`
     /// custom section.
     pub name: Option<String>,
+
     pub(crate) config: ModuleConfig,
 }
 
-/// Emitted module information.
-#[derive(Debug)]
-pub struct EmitResult {
-    /// The wasm file bytecode.
-    pub wasm: Vec<u8>,
-
-    /// Optional code transform (if module generated from
-    /// the existing wasm file).
-    pub code_transform: Vec<(usize, usize)>,
-}
-
-impl Into<Vec<u8>> for EmitResult {
-    fn into(self) -> Vec<u8> {
-        self.wasm
-    }
-}
+/// Maps from an offset of an instruction in the input Wasm to its offset in the
+/// output Wasm.
+///
+/// Note that an input offset may be mapped to multiple output offsets, and vice
+/// versa, due to transformations like function inlinining or constant
+/// propagation.
+pub type CodeTransform = Vec<(usize, usize)>;
 
 impl Module {
     /// Create a default, empty module that uses the given configuration.
@@ -243,23 +236,25 @@ impl Module {
     }
 
     /// Emit this module into a `.wasm` file at the given path.
-    pub fn emit_wasm_file<P>(&self, path: P) -> Result<()>
+    pub fn emit_wasm_file<P>(&mut self, path: P) -> Result<()>
     where
         P: AsRef<Path>,
     {
-        let EmitResult { wasm: buffer, .. } = self.emit_wasm()?;
+        let buffer = self.emit_wasm();
         fs::write(path, buffer).context("failed to write wasm module")?;
         Ok(())
     }
 
     /// Emit this module into an in-memory wasm buffer.
-    pub fn emit_wasm(&self) -> Result<Vec<u8>> {
+    pub fn emit_wasm(&mut self) -> Vec<u8> {
         log::debug!("start emit");
 
         let indices = &mut IdsToIndices::default();
         let mut wasm = Vec::new();
         wasm.extend(&[0x00, 0x61, 0x73, 0x6d]); // magic
         wasm.extend(&[0x01, 0x00, 0x00, 0x00]); // version
+
+        let mut customs = mem::replace(&mut self.customs, ModuleCustomSections::default());
 
         let mut cx = EmitContext {
             module: self,
@@ -291,24 +286,27 @@ impl Module {
             self.producers.emit(&mut cx);
         }
 
-        for (_id, section) in self.customs.iter() {
+        for (_id, section) in customs.iter_mut() {
             if !self.config.generate_dwarf && section.name().starts_with(".debug") {
                 log::debug!("skipping DWARF custom section {}", section.name());
                 continue;
             }
 
-            section.
-
             log::debug!("emitting custom section {}", section.name());
+
+            if self.config.preserve_code_transform {
+                section.apply_code_transform(&cx.code_transform);
+            }
+
             cx.custom_section(&section.name())
                 .encoder
                 .raw(&section.data());
         }
 
-        let code_transform = cx.code_transform;
+        self.customs = customs;
 
         log::debug!("emission finished");
-        Ok(wasm)
+        wasm
     }
 
     /// Returns an iterator over all functions in this module
